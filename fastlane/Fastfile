@@ -1,0 +1,271 @@
+fastlane_version "2.62.1"
+
+fastlane_require 'dotenv'
+Dotenv.load '.env.secret'
+
+default_platform :ios
+skip_docs # Do not create fastlane/README.md
+
+def escape_markdown(str)
+  str.gsub(/([_*\[`])/, '\\\\\1')
+end
+
+def truncate(string, max)
+  string.length > max ? "#{string[0...max]}\n..." : string
+end
+
+platform :ios do
+  before_all do
+    ensure_env_vars(
+      env_vars: ['GIT_DOCUMENTS_PASSPHRASE']
+    )
+
+    ENV["FASTLANE_XCODEBUILD_SETTINGS_RETRIES"] = "10"
+    ENV["FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT"] = "60"
+    ENV["FASTLANE_XCODE_LIST_TIMEOUT"] = "60"
+
+    cocoapods(
+      repo_update: true
+    )
+    sh "../.github/secrets/decrypt_secret.sh"
+  end
+
+  def version_string(version_number, build_number)
+    "#{version_number} (#{build_number})"
+  end
+
+  desc "Refresh dSYMs"
+  lane :refresh_dsyms do
+    download_dsyms(
+      wait_for_dsym_processing: true
+    )
+    upload_symbols_to_crashlytics
+    clean_build_artifacts
+  end
+
+  desc "Unlock keychain"
+  lane :unlock_keystore do
+    unlock_keychain(
+      path: ENV["KEYSTORAGE_NAME"],
+      password: ENV["KEYSTORAGE_PASSWORD"],
+      set_default: true)
+  end
+
+  desc "Runs all the tests"
+  lane :test do
+    scan(
+      scheme: "Documents",
+      workspace: "ONLYOFFICE-Documents.xcworkspace",
+      devices: ["iPhone 15 Pro"],
+      clean: true
+    )
+  end
+
+  desc "Submit a new Beta Build to Apple TestFlight"
+  desc "This will also make sure the profile is up to date"
+  lane :beta do |options|
+    # match(type: "appstore") # more information: https://codesigning.guide
+    # ensure_git_status_clean
+
+    version_number = get_info_plist_value(
+      path: "Documents/Documents/Documents.plist",
+      key: "CFBundleShortVersionString"
+    )
+    build_number = get_info_plist_value(
+      path: "Documents/Documents/Documents.plist", 
+      key: "CFBundleVersion"
+    )
+
+    # Build
+    gym(
+      clean: true,
+      scheme: "Documents",
+      workspace: "ONLYOFFICE-Documents.xcworkspace",
+      xcargs: "-allowProvisioningUpdates"
+    )
+
+    # get the last commit comments from Git history
+    # and creates our changelog
+    change_log = changelog_from_git_commits(
+      pretty: "- %s",
+      date_format: "short",
+      match_lightweight_tag: false,
+      merge_commit_filtering: "exclude_merges"
+    )
+
+    # Read changelog file
+    change_log_file = options[:changelog_file]
+    if !change_log_file.nil? && File.exist?(change_log_file)
+      change_log = File.read(change_log_file)
+    end
+
+    appstore_change_log = truncate(change_log, 3500)
+    telegram_change_log = truncate(escape_markdown(change_log), 3500)
+
+    # creates a bump version commit 
+    commit_version_bump(
+        xcodeproj: "Documents/Documents.xcodeproj",
+        message: "Version bumped to v#{version_number}(#{build_number})",
+        settings: true,
+        include: [
+          "Documents/Documents/Documents.plist",
+          "Documents/Settings.bundle/Root.plist"
+        ]
+    )
+
+    # create a local tag with the new version
+    add_git_tag(
+      tag: "v#{version_number}-#{build_number}",
+      build_number: build_number
+    )
+
+    # push changes
+    push_to_git_remote
+
+    # Use the shared value in lane context
+    app_store_connect_api_key(
+      key_id: ENV['API_KEY_ID'],
+      issuer_id: ENV['API_ISSUER_ID'],
+      key_content: ENV['API_KEY_CONTENT'],
+      in_house: false
+    )
+
+    # Submit to iTunes Connect
+    pilot(
+      app_identifier: ENV["APP_IDENTIFIER"],
+      changelog: appstore_change_log,
+      distribute_external: true,
+      groups: ["Company users"],
+      notify_external_testers: true,
+      submit_beta_review: true,
+      skip_waiting_for_build_processing: true
+    )
+
+    begin
+      telegram(
+        token: ENV['TELEGRAM_BOT_TOKEN'],
+        chat_id: ENV['TELEGRAM_CHAT_ID'],
+        parse_mode: 'Markdown',
+        text: ENV["TELEGRAM_DOCUMENTS_IOS_MESSAGE"] % [version_number: "#{version_number}", build_number: "#{build_number}", change_log: "#{telegram_change_log}"]
+      )
+    rescue => ex
+      UI.error(ex)
+    end
+
+    clean_build_artifacts
+
+  end
+
+  desc "Submit a new Beta Build to Apple TestFlight Develop"
+  lane :alpha do |options|
+    # match(type: "appstore") # more information: https://codesigning.guide
+    # ensure_git_status_clean
+
+    version_number = get_info_plist_value(
+      path: "Documents/Documents/Documents.alpha.plist",
+      key: "CFBundleShortVersionString"
+    )
+    build_number = get_info_plist_value(
+      path: "Documents/Documents/Documents.alpha.plist",
+      key: "CFBundleVersion"
+    )
+    bumped_build_number = build_number.to_i.next.to_s
+
+    # Update app icon
+    add_badge(
+      custom: "fastlane/badge-test.png"
+    )
+
+    # Build
+    gym(
+      clean: true,
+      scheme: "Documents-Alpha",
+      workspace: "ONLYOFFICE-Documents.xcworkspace",
+      xcargs: "-allowProvisioningUpdates"
+    )
+
+    # get the last commit comments from Git history
+    # and creates our changelog
+    change_log = ""
+
+    # Read changelog file
+    change_log_file = options[:changelog_file]
+    if !change_log_file.nil? && File.exist?(change_log_file)
+      change_log = File.read(change_log_file)
+    end
+
+    appstore_change_log = truncate(change_log, 3500)
+    telegram_change_log = truncate(escape_markdown(change_log), 3500)
+
+    # creates a bump version commit
+    update_plist(
+      plist_path: "Documents/Documents/Documents.alpha.plist",
+      block: proc do |plist|
+        plist[:CFBundleVersion] = bumped_build_number
+      end
+    )
+    update_plist(
+      plist_path: "Documents/Settings.bundle/Root.plist",
+      block: proc do |plist|
+        versionInfo = plist["PreferenceSpecifiers"].find{|scheme| scheme["Key"] == "version_preference"}
+        versionInfo[:DefaultValue] = "#{version_number} (#{bumped_build_number})"
+      end
+    )
+
+    git_commit(
+      path: [
+        "Documents/Documents/Documents.alpha.plist",
+        "Documents/Settings.bundle/Root.plist"
+      ], 
+      message: "Version bumped to v#{version_number}-dev (#{build_number})"
+    )
+
+    # push changes
+    push_to_git_remote
+
+    # Use the shared value in lane context
+    app_store_connect_api_key(
+      key_id: ENV['API_KEY_ID'],
+      issuer_id: ENV['API_ISSUER_ID'],
+      key_content: ENV['API_KEY_CONTENT'],
+      in_house: false
+    )
+
+    # Submit to iTunes Connect
+    pilot(
+      app_identifier: ENV["APP_DEV_IDENTIFIER"],
+      skip_waiting_for_build_processing: true
+    )
+
+    begin
+      telegram(
+        token: ENV['TELEGRAM_BOT_TOKEN'],
+        chat_id: ENV['TELEGRAM_CHAT_ID'],
+        parse_mode: 'Markdown',
+        text: ENV["TELEGRAM_DOCUMENTS_IOS_MESSAGE"] % [version_number: "#{version_number}", build_number: "#{build_number}", change_log: "#{telegram_change_log}"]
+      )
+    rescue => ex
+      UI.error(ex)
+    end
+
+    # Reset changes
+    reset_git_repo(force: true)
+    clean_build_artifacts
+
+  end
+
+  # You can define as many lanes as you want
+
+  after_all do |lane|
+    # This block is called, only if the executed lane was successful
+  end
+
+  error do |lane, exception|
+    # slack(
+    #   message: exception.message,
+    #   success: false
+    # )
+  end
+end
+
+
